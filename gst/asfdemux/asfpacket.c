@@ -71,9 +71,10 @@ asf_packet_read_varlen_int (guint lentype_flags, guint lentype_bit_offset,
 
 static GstBuffer *
 asf_packet_create_payload_buffer (AsfPacket * packet, const guint8 ** p_data,
-    guint * p_size, guint payload_len)
+    guint * p_size, guint payload_len, gboolean need_st_code)
 {
   guint off;
+  guint8 *st_code;
 
   g_assert (payload_len <= *p_size);
 
@@ -82,6 +83,21 @@ asf_packet_create_payload_buffer (AsfPacket * packet, const guint8 ** p_data,
 
   *p_data += payload_len;
   *p_size -= payload_len;
+
+  /* set start code for VC-1 advanced profile */
+  if (need_st_code && off >= 4) {
+    st_code = GST_BUFFER_DATA (packet->buf) + (off - 4);
+    /* check if this packet has a start code */
+    if (st_code[4] != 0x00 || st_code[5] != 0x00 || st_code[6] != 0x01 ||
+        st_code[7] != 0x0d) {
+      st_code[0] = 0x00;
+      st_code[1] = 0x00;
+      st_code[2] = 0x01;
+      st_code[3] = 0x0d;
+
+      return gst_buffer_create_sub (packet->buf, off - 4, payload_len + 4);
+    }
+  }
 
   return gst_buffer_create_sub (packet->buf, off, payload_len);
 }
@@ -274,6 +290,9 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
   gboolean is_compressed;
   guint payload_len;
   guint stream_num;
+  GstStructure *structure;
+  guint32 fourcc;
+  gboolean need_st_code = FALSE;
 
   if (G_UNLIKELY (*p_size < 1)) {
     GST_WARNING_OBJECT (demux, "Short packet!");
@@ -353,6 +372,17 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
     return TRUE;
   }
 
+  structure = gst_caps_get_structure (stream->caps, 0);
+  if (gst_structure_get_fourcc (structure, "format", &fourcc)) {
+    /*
+     * set start code for VC-1 advanced profile if fourcc is 'WVC1' and this
+     * packet is at the head of a payload.
+     */
+    if (fourcc == GST_MAKE_FOURCC ('W', 'V', 'C', '1')
+        && payload.mo_offset == 0)
+      need_st_code = TRUE;
+  }
+
   if (G_UNLIKELY (!is_compressed)) {
     GST_LOG_OBJECT (demux, "replicated data length: %u", payload.rep_data_len);
 
@@ -384,7 +414,7 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
     if ((stream = gst_asf_demux_get_stream (demux, stream_num))
         && payload_len) {
       payload.buf = asf_packet_create_payload_buffer (packet, p_data, p_size,
-          payload_len);
+          payload_len, need_st_code);
 
       /* n-th fragment of a fragmented media object? */
       if (payload.mo_offset != 0) {
@@ -443,7 +473,7 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
 
       if (G_LIKELY (sub_payload_len > 0)) {
         payload.buf = asf_packet_create_payload_buffer (packet,
-            &payload_data, &payload_len, sub_payload_len);
+            &payload_data, &payload_len, sub_payload_len, need_st_code);
 
         payload.ts = ts;
         if (G_LIKELY (ts_delta))
