@@ -72,7 +72,7 @@ asf_packet_read_varlen_int (guint lentype_flags, guint lentype_bit_offset,
 
 static GstBuffer *
 asf_packet_create_payload_buffer (AsfPacket * packet, const guint8 ** p_data,
-    guint * p_size, guint payload_len)
+    guint * p_size, guint payload_len, gboolean need_st_code)
 {
   guint off;
 
@@ -83,6 +83,39 @@ asf_packet_create_payload_buffer (AsfPacket * packet, const guint8 ** p_data,
 
   *p_data += payload_len;
   *p_size -= payload_len;
+
+  /* set start code for VC-1 advanced profile */
+  if (need_st_code && off >= 4) {
+    const guint8 *pos;
+
+    pos = packet->bdata + off;
+    /* check if this packet has a start code */
+    if (pos[0] != 0x00 || pos[1] != 0x00 || pos[2] != 0x01 || pos[3] != 0x0d) {
+      GstBuffer *subbuf;
+      GstMapInfo map;
+
+      subbuf = gst_buffer_copy_region (packet->buf, GST_BUFFER_COPY_ALL,
+          off - 4, payload_len + 4);
+      if (subbuf == NULL) {
+        GST_ERROR ("Failed to create a sub-buffer");
+        return NULL;
+      }
+
+      if (!gst_buffer_map (subbuf, &map, GST_MAP_WRITE)) {
+        GST_ERROR ("Failed to create a gstbuffer mapping");
+        return NULL;
+      }
+
+      map.data[0] = 0x00;
+      map.data[1] = 0x00;
+      map.data[2] = 0x01;
+      map.data[3] = 0x0d;
+
+      gst_buffer_unmap (subbuf, &map);
+
+      return subbuf;
+    }
+  }
 
   return gst_buffer_copy_region (packet->buf, GST_BUFFER_COPY_ALL, off,
       payload_len);
@@ -276,6 +309,9 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
   gboolean is_compressed;
   guint payload_len;
   guint stream_num;
+  GstStructure *structure;
+  const gchar *fourcc;
+  gboolean need_st_code = FALSE;
 
   if (G_UNLIKELY (*p_size < 1)) {
     GST_WARNING_OBJECT (demux, "Short packet!");
@@ -357,6 +393,18 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
     return TRUE;
   }
 
+  structure = gst_caps_get_structure (stream->caps, 0);
+  fourcc = gst_structure_get_string (structure, "format");
+  if (fourcc) {
+    /*
+     * set start code for VC-1 advanced profile if fourcc is 'WVC1' and this
+     * packet is at the head of a payload.
+     */
+    if (strncmp (fourcc, "WVC1", strlen ("WVC1")) == 0
+        && payload.mo_offset == 0)
+      need_st_code = TRUE;
+  }
+
   if (G_UNLIKELY (!is_compressed)) {
     GST_LOG_OBJECT (demux, "replicated data length: %u", payload.rep_data_len);
 
@@ -393,7 +441,7 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
       /* if the media object is not fragmented, just create a sub-buffer */
       GST_LOG_OBJECT (demux, "unfragmented media object size %u", payload_len);
       payload.buf = asf_packet_create_payload_buffer (packet, p_data, p_size,
-          payload_len);
+          payload_len, need_st_code);
       payload.buf_filled = payload_len;
       gst_asf_payload_queue_for_stream (demux, &payload, stream);
     } else {
@@ -434,11 +482,24 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
               "any previous fragment, ignoring payload");
         }
       } else {
+        const guint8 st_code[] = { 0x00, 0x00, 0x01, 0x0d };
+
         GST_LOG_OBJECT (demux, "allocating buffer of size %u for fragmented "
             "media object", payload.mo_size);
-        payload.buf = gst_buffer_new_allocate (NULL, payload.mo_size, NULL);
-        gst_buffer_fill (payload.buf, 0, payload_data, payload_len);
-        payload.buf_filled = payload_len;
+        if ((payload_data[0] != 0x00 || payload_data[1] != 0x00 ||
+                payload_data[2] != 0x01 || payload_data[3] != 0x0d) &&
+            need_st_code) {
+          /* set start code for VC-1 advanced profile */
+          payload.buf =
+              gst_buffer_new_allocate (NULL, payload.mo_size + 4, NULL);
+          gst_buffer_fill (payload.buf, 0, st_code, sizeof (st_code));
+          gst_buffer_fill (payload.buf, 4, payload_data, payload_len);
+          payload.buf_filled = payload_len + sizeof (st_code);
+        } else {
+          payload.buf = gst_buffer_new_allocate (NULL, payload.mo_size, NULL);
+          gst_buffer_fill (payload.buf, 0, payload_data, payload_len);
+          payload.buf_filled = payload_len;
+        }
 
         gst_asf_payload_queue_for_stream (demux, &payload, stream);
       }
@@ -480,7 +541,7 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
 
       if (G_LIKELY (sub_payload_len > 0)) {
         payload.buf = asf_packet_create_payload_buffer (packet,
-            &payload_data, &payload_len, sub_payload_len);
+            &payload_data, &payload_len, sub_payload_len, need_st_code);
         payload.buf_filled = sub_payload_len;
 
         payload.ts = ts;
