@@ -422,10 +422,10 @@ gst_asf_demux_parse_payload (GstASFDemux * demux, AsfPacket * packet,
                   "offset=%u vs buf_filled=%u", payload.mo_offset,
                   prev->buf_filled);
             }
-            gst_buffer_fill (prev->buf, payload.mo_offset,
+            gst_buffer_fill (prev->buf, prev->buf_filled,
                 payload_data, payload_len);
-            prev->buf_filled =
-                MAX (prev->buf_filled, payload.mo_offset + payload_len);
+            if ((payload.mo_offset + payload_len) > prev->buf_filled)
+              prev->buf_filled += payload_len;
             GST_LOG_OBJECT (demux, "Merged media object fragments, size now %u",
                 prev->buf_filled);
           }
